@@ -25,6 +25,7 @@
 #include <ffmpeg_encoder_decoder/utils.hpp>
 #include <fstream>
 #include <iomanip>
+#include <sensor_msgs/image_encodings.hpp>
 #include <string>
 
 namespace ffmpeg_encoder_decoder
@@ -195,6 +196,15 @@ enum AVPixelFormat Encoder::findMatchingSourceFormat(
   return (utils::ros_to_av_pix_format(rosSrcFormat));
 }
 
+// Encodings that swscale can read directly, so they need no cv_bridge conversion first.
+static bool isDirectSourceEncoding(const std::string & encoding)
+{
+  namespace enc = sensor_msgs::image_encodings;
+  return (
+    encoding == enc::RGB8 || encoding == enc::BGR8 || encoding == enc::RGBA8 ||
+    encoding == enc::BGRA8 || encoding == enc::YUV422 || encoding == enc::YUV422_YUY2);
+}
+
 void Encoder::doOpenCodec(int width, int height, const std::string & origEncoding)
 {
   int err = 0;
@@ -202,6 +212,11 @@ void Encoder::doOpenCodec(int width, int height, const std::string & origEncodin
   codecContext_ = nullptr;
   if (encoder_.empty()) {
     throw(std::runtime_error("no codec set!"));
+  }
+  // Feed the source image to swscale as it is, instead of converting it to
+  // bgr8 with cv_bridge first (a full extra copy + channel swap).
+  if (isDirectSourceEncoding(origEncoding)) {
+    cvBridgeTargetFormat_ = origEncoding;
   }
   if ((width % 32) != 0) {
     RCLCPP_WARN(logger_, "horiz res must be multiple of 32!");
@@ -352,6 +367,14 @@ void Encoder::encodeImage(const Image & msg)
         msg.step);
       // Add empty color channels to the bottom of matrix
       img.push_back(cv::Mat::zeros(msg.height / 2, msg.width, cv::DataType<uint8_t>::type));
+      doEncodeImage(img, msg.header, t0);
+    } else if (
+      msg.encoding == cvBridgeTargetFormat_ &&
+      static_cast<int>(msg.step) ==
+        av_image_get_linesize(static_cast<AVPixelFormat>(wrapperFrame_->format), msg.width, 0)) {
+      // already in the source format, without row padding: wrap without copying
+      cv::Mat img(
+        msg.height, msg.step, cv::DataType<uint8_t>::type, const_cast<uint8_t *>(msg.data.data()));
       doEncodeImage(img, msg.header, t0);
     } else {
       cv::Mat img = cv_bridge::toCvCopy(msg, cvBridgeTargetFormat_)->image;
